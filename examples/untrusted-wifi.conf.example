@@ -1,0 +1,26 @@
+# /etc/net-hardening/untrusted-wifi.conf -- settings for the untrusted-wifi dispatcher
+# and install.sh. Shell syntax, read by root. Keep it owned by root and not writable by
+# anyone else: otherwise the dispatcher ignores it and trusts no network.
+# Edit with: sudoedit /etc/net-hardening/untrusted-wifi.conf
+
+# Wi-Fi interface the egress lock applies to (list them with: ip -br link).
+WIFI_IFACE=wlan0
+
+# NetworkManager connection names (profile IDs -- the SSID when the network was joined
+# from the tray) on which the lock is lifted. Every other Wi-Fi network is untrusted.
+# Trust is decided by this name only. Never keep a network you no longer use here:
+# anyone could broadcast its name.
+TRUSTED_IDS=("HomeNetwork" "HomeNetwork-5G")
+
+# Proton VPN's cached server list, in the home of the user who runs the Proton app.
+# Its entry IPs become the only addresses reachable outside the tunnel. If it can't be
+# read, the lock falls back to allowing Proton's VPN ports to any address (weaker).
+PROTON_SERVERLIST=/home/youruser/.cache/Proton/VPN/serverlist.json
+
+# --- Optional, used by install.sh only ---------------------------------------------
+# Allow KDE Connect (port 1716) through ufw only from this LAN. Empty = leave ufw alone.
+KDECONNECT_LAN=""                     # e.g. "192.0.2.0/24"
+# Broader KDE Connect allow rules from earlier setups that install.sh should delete.
+KDECONNECT_REVOKE=()                  # e.g. ("198.51.100.0/24")
+# NetworkManager connections that must not send this machine's hostname via DHCP.
+NO_DHCP_HOSTNAME_IDS=()               # e.g. ("CafeWiFi" "Library Guest")

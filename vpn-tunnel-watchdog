@@ -1,0 +1,88 @@
+#!/bin/bash
+# vpn-tunnel-watchdog: run vpn-reset when Proton's tunnel goes silently dead.
+#
+# A server can stop passing traffic while the Proton app only notices 2-3 minutes
+# later, so each drop lasts 3-4 min although vpn-reset fixes it in seconds.
+#
+# Every INTERVAL s: the tunnel counts as alive if data came in through it since the
+# last check, or Proton's DNS server (10.2.0.1, inside the tunnel) answers a ping.
+# FAILS dead checks in a row = dead tunnel. Before resetting, it pings a few Proton
+# servers over the Wi-Fi, outside the tunnel: if none answers, the Wi-Fi or the
+# upstream internet is down and a VPN reset can't help, so it waits. Otherwise it
+# runs vpn-reset, telling it to skip the server that died. If that doesn't get the
+# VPN up, it waits twice as long before trying again, up to 30 min.
+# It never touches the kill switch setting or the untrusted-wifi lock.
+#
+# Wi-Fi device: VPN_TUNNEL_WIFI_DEV, else NET_HARDENING_WIFI_DEV, else the first Wi-Fi
+# device NetworkManager lists.
+# Runs as a user service:  systemctl --user status vpn-tunnel-watchdog
+# Logs:                    journalctl --user -u vpn-tunnel-watchdog
+set -u
+HERE="$(dirname "$(readlink -f "$0")")"
+first_dev() { nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: -v t="$1" '$2==t{print $1; exit}'; }
+WIFI_DEV="${VPN_TUNNEL_WIFI_DEV:-${NET_HARDENING_WIFI_DEV:-$(first_dev wifi)}}"
+[ -n "$WIFI_DEV" ] || { echo "no Wi-Fi device found -- set VPN_TUNNEL_WIFI_DEV"; exit 1; }
+INTERVAL="${VPN_TUNNEL_INTERVAL:-5}"
+FAILS="${VPN_TUNNEL_FAILS:-4}"
+COOLDOWN="${VPN_TUNNEL_COOLDOWN:-120}"     # gap after a reset before another one
+MAX_COOLDOWN=1800
+
+ms()     { awk -v s="$1" 'BEGIN { printf "%d", s * 1000 }'; }   # seconds -> ms (tests use 0.2 s)
+now_ms() { local t=${EPOCHREALTIME//[.,]/}; echo $(( t / 1000 )); }
+
+tunnel()    { nmcli -t -f NAME,TYPE,DEVICE connection show --active 2>/dev/null | awk -F: '$2=="wireguard"{print $1"|"$3; exit}'; }
+rx_bytes()  { cat "/sys/class/net/$1/statistics/rx_bytes" 2>/dev/null || echo 0; }
+dns_of()    { nmcli -g IP4.DNS device show "$1" 2>/dev/null | head -1; }
+ping_via()  { ping -c1 -W2 -I "$1" "$2" >/dev/null 2>&1; }
+landmarks() { "$HERE/vpn-pick-server" landmarks 2>/dev/null; }
+reset_vpn() { "$HERE/vpn-reset" --skip="$1"; }
+[ -n "${VPN_TUNNEL_STUBS:-}" ] && . "$VPN_TUNNEL_STUBS"   # tests
+
+outside_ok() {  # does anything answer over the Wi-Fi, outside the tunnel?
+  local ips ip; ips=$(landmarks)
+  [ -n "$ips" ] || return 0      # no server list to test with -- let vpn-reset try
+  for ip in $ips; do ping_via "$WIFI_DEV" "$ip" && return 0; done
+  return 1
+}
+
+echo "watching Proton's tunnel"
+cur=""; misses=0; last_rx=0; last_fix=0; wait_ms=$(ms "$COOLDOWN"); waiting=0
+while :; do
+  IFS='|' read -r name dev <<< "$(tunnel)"
+  if [ -z "$name" ] || [ -z "$dev" ]; then
+    cur=""; misses=0               # VPN off or reconnecting -- vpn-failover's job
+  else
+    server=${name#ProtonVPN }
+    rx=$(rx_bytes "$dev")
+    if [ "$name" != "$cur" ]; then
+      cur=$name; misses=0; waiting=0; last_rx=$rx
+      echo "$server: watching"
+    fi
+    dns=$(dns_of "$dev")
+    if [ "$rx" != "$last_rx" ] || ping_via "$dev" "${dns:-10.2.0.1}"; then
+      [ $misses = 0 ] || echo "$server: tunnel answers again"
+      misses=0; waiting=0
+    else
+      misses=$((misses + 1))
+      if (( misses >= FAILS && $(now_ms) - last_fix >= wait_ms )); then
+        if ! outside_ok; then
+          [ $waiting = 1 ] || echo "$server: tunnel silent, but so is the internet outside it (Wi-Fi or upstream down) -- a VPN reset can't help, waiting"
+          waiting=1
+        else
+          echo "$server: tunnel silent for $misses checks while the internet outside it works -- running vpn-reset"
+          if reset_vpn "$server"; then
+            echo "vpn-reset done"
+            wait_ms=$(ms "$COOLDOWN")
+          else
+            wait_ms=$(( wait_ms * 2 > MAX_COOLDOWN * 1000 ? MAX_COOLDOWN * 1000 : wait_ms * 2 ))
+            echo "vpn-reset didn't get the VPN up -- next try no sooner than $(( wait_ms / 1000 ))s"
+          fi
+          last_fix=$(now_ms); misses=0; waiting=0; cur=""
+          rx=$(rx_bytes "$dev")
+        fi
+      fi
+    fi
+    last_rx=$rx
+  fi
+  sleep "$INTERVAL"
+done

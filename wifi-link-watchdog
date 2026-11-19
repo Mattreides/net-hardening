@@ -1,0 +1,72 @@
+#!/bin/bash
+# wifi-link-watchdog: reconnect the Wi-Fi when the link goes silently dead.
+#
+# Seen in practice: each time the router narrowed its 2.4 GHz channel from 40 to
+# 20 MHz -- kernel log "AP ... changed bandwidth in beacon" -- the machine stayed
+# "connected" but nothing got through, not even to the router, until the Wi-Fi was
+# reconnected (one outage lasted 50 min). Reconnecting to the same network fixed it
+# every time.
+#
+# Every INTERVAL s this pings the Wi-Fi's gateway. Once the gateway has answered
+# on the current connection, FAILS misses in a row = dead link: reconnect the same
+# network. A gateway that never answers (a network that blocks ping, or the
+# untrusted-wifi lock blocking it) is never judged. If reconnecting doesn't bring the gateway
+# back (router itself down), wait twice as long before the next try, up to 30 min.
+#
+# Wi-Fi device: WIFI_WATCHDOG_DEV, else NET_HARDENING_WIFI_DEV, else the first Wi-Fi
+# device NetworkManager lists.
+# Runs as a user service:  systemctl --user status wifi-link-watchdog
+# Logs:                    journalctl --user -u wifi-link-watchdog
+set -u
+first_dev() { nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: -v t="$1" '$2==t{print $1; exit}'; }
+DEV="${WIFI_WATCHDOG_DEV:-${NET_HARDENING_WIFI_DEV:-$(first_dev wifi)}}"
+[ -n "$DEV" ] || { echo "no Wi-Fi device found -- set WIFI_WATCHDOG_DEV"; exit 1; }
+INTERVAL="${WIFI_WATCHDOG_INTERVAL:-5}"
+FAILS="${WIFI_WATCHDOG_FAILS:-4}"
+SETTLE="${WIFI_WATCHDOG_SETTLE:-20}"      # how long to wait for the gateway after reconnecting
+COOLDOWN="${WIFI_WATCHDOG_COOLDOWN:-60}"
+MAX_COOLDOWN=1800
+
+current()   { nmcli -g GENERAL.CONNECTION,IP4.GATEWAY device show "$DEV" 2>/dev/null | paste -sd'|'; }
+gw_alive()  { ping -c1 -W1 -I "$DEV" "$1" >/dev/null 2>&1; }
+reconnect() { nmcli --wait 30 connection up id "$1" >/dev/null 2>&1; }
+[ -n "${WIFI_WATCHDOG_STUBS:-}" ] && . "$WIFI_WATCHDOG_STUBS"   # tests
+
+settled() {  # wait up to SETTLE s for the gateway to answer
+  local gw; for _ in $(seq 1 "$SETTLE"); do
+    IFS='|' read -r _ gw <<< "$(current)"
+    [ -n "$gw" ] && gw_alive "$gw" && return 0
+    sleep 1
+  done
+  return 1
+}
+
+echo "watching $DEV"
+conn=""; seen=0; misses=0; last_fix=0; wait_s=$COOLDOWN
+while :; do
+  IFS='|' read -r name gw <<< "$(current)"
+  if [ -z "$name" ] || [ -z "$gw" ]; then
+    conn=""; seen=0; misses=0
+  else
+    [ "$name|$gw" = "$conn" ] || { conn="$name|$gw"; seen=0; misses=0; }
+    if gw_alive "$gw"; then
+      [ $seen = 1 ] || echo "$name: gateway $gw answers -- watching"
+      seen=1; misses=0
+    elif [ $seen = 1 ]; then
+      misses=$((misses + 1))
+      if (( misses >= FAILS && $(date +%s) - last_fix >= wait_s )); then
+        echo "$name: gateway $gw silent for $misses checks -- reconnecting Wi-Fi"
+        reconnect "$name"
+        if settled; then
+          echo "$name: back"
+          wait_s=$COOLDOWN
+        else
+          wait_s=$(( wait_s * 2 > MAX_COOLDOWN ? MAX_COOLDOWN : wait_s * 2 ))
+          echo "$name: gateway still silent after reconnect (router down?) -- next try no sooner than ${wait_s}s"
+        fi
+        last_fix=$(date +%s); misses=0
+      fi
+    fi
+  fi
+  sleep "$INTERVAL"
+done

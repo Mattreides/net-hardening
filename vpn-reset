@@ -1,0 +1,199 @@
+#!/bin/bash
+# vpn-reset: get back online when Proton VPN is stuck -- without rebooting.
+#
+# Does for the network what a reboot does: stops the Proton app for real (its
+# Quit menu can leave the process running in a broken state), clears the VPN +
+# kill-switch connections it leaves behind in NetworkManager and the interfaces they
+# ran on, turns Wi-Fi back on, then relaunches Proton, which auto-connects
+# (connect_at_app_startup).
+# Before relaunching it checks that the server Proton will pick actually answers
+# (vpn-pick-server); if not, Proton starts on the fastest one that does, just this
+# once -- your "connect at startup" setting is put back afterwards. Cities listed in
+# ~/.config/net-hardening/vpn-avoid are never picked. In pinned mode
+# (vpn-pick-server manage US) the setting is kept on one working server outside
+# those cities, and moved to another when that one stops working.
+# It never touches the untrusted-wifi lock.
+#
+#   vpn-reset                     reset, stay on the current Wi-Fi
+#   vpn-reset "CafeWiFi"          reset and switch to that Wi-Fi first
+#   vpn-reset --skip=US-BB#16     the tunnel to that server just died -- pick another
+#   vpn-reset --dry-run           show what would happen, change nothing
+#
+# Logs to the journal: journalctl -t vpn-reset
+set -u
+APP_RE='^/usr/bin/python[0-9.]* /usr/bin/protonvpn-app'
+WAIT_VPN="${VPN_RESET_WAIT:-60}"
+PICK="$(dirname "$(readlink -f "$0")")/vpn-pick-server"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/vpn-reset"
+OVERRIDE_FILE="$STATE_DIR/startup-override"  # "<your setting>\t<server used instead>"
+
+DRY=0; TARGET=""; SKIP=""
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY=1 ;;
+    --skip=*)  SKIP=${a#--skip=} ;;
+    -h|--help) sed -n 2,22p "$0"; exit 0 ;;
+    *) TARGET="$a" ;;
+  esac
+done
+
+# Wi-Fi / Ethernet device: NET_HARDENING_WIFI_DEV / NET_HARDENING_WIRED_DEV, or else the
+# first device of that type NetworkManager lists.
+first_dev() { nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: -v t="$1" '$2==t{print $1; exit}'; }
+WIFI_DEV="${NET_HARDENING_WIFI_DEV:-$(first_dev wifi)}"
+WIRED_DEV="${NET_HARDENING_WIRED_DEV:-$(first_dev ethernet)}"
+
+# Launched from the menu, stdout already goes to the journal -- echoing there as
+# well as calling logger made every line show up twice.
+TO_JOURNAL=0
+[ -n "${JOURNAL_STREAM:-}" ] && [ "$(stat -L -c '%d:%i' /proc/$$/fd/1 2>/dev/null)" = "$JOURNAL_STREAM" ] && TO_JOURNAL=1
+say()    { if [ $DRY = 1 ] || [ $TO_JOURNAL = 0 ]; then echo "$*"; fi; [ $DRY = 1 ] || logger -t vpn-reset -- "$*"; }
+notify() { [ $DRY = 1 ] || notify-send -a "VPN reset" -i network-vpn "$1" "${2:-}" 2>/dev/null || true; }
+run()    { if [ $DRY = 1 ]; then echo "  (dry-run) $*" >&2; else "$@"; fi; }
+wait_for() {  # wait_for <seconds> <command...>: poll until the command succeeds
+  local n=$(( $1 * 2 )); shift
+  for _ in $(seq 1 "$n"); do "$@" && return 0; sleep 0.5; done
+  return 1
+}
+app_running()   { pgrep -f "$APP_RE" >/dev/null; }
+app_gone()      { ! app_running; }
+wifi_up()       { [ "$(nmcli -g GENERAL.STATE device show "$WIFI_DEV" 2>/dev/null | cut -d' ' -f1)" = 100 ]; }
+vpn_up()        { nmcli -t -f TYPE,STATE connection show --active | grep -q '^wireguard:activated$'; }
+wifi_name()     { nmcli -g GENERAL.CONNECTION device show "$WIFI_DEV" 2>/dev/null; }
+# Interfaces Proton creates: kill switch + IPv6-leak dummies (1 = permanent kill switch), tunnel.
+proton_ifaces() { ip -o link show 2>/dev/null | awk -F': ' '{sub(/@.*/, "", $2); print $2}' \
+                    | grep -E '^(pvpnksintrf[01]|ipv6leakintrf[01]|proton0)$'; }
+no_proton_ifaces() { [ -z "$(proton_ifaces)" ]; }
+
+# Put back the "connect at startup" setting if we redirected it. Only if it still
+# holds the server we wrote, so a change you made yourself is never overwritten.
+restore_startup() {
+  [ -f "$OVERRIDE_FILE" ] || return 0
+  local orig temp
+  IFS=$'\t' read -r orig temp < "$OVERRIDE_FILE"
+  if "$PICK" set-startup "$orig" --expect "$temp" 2>/dev/null; then
+    say "Proton's connect-at-startup setting back to $orig"
+  fi
+}
+
+# One reset at a time (a double-click on the menu entry would otherwise race).
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/vpn-reset.lock"
+flock -n 9 || { echo "vpn-reset already running"; exit 0; }
+
+say "vpn-reset starting${TARGET:+ (target Wi-Fi: $TARGET)}${SKIP:+ (tunnel to $SKIP died)}"
+if [ -z "$WIFI_DEV" ]; then
+  say "FAILED: no Wi-Fi device found -- set NET_HARDENING_WIFI_DEV"
+  exit 1
+fi
+
+# The app keeps its settings in memory and saves them all if you change one in its
+# Settings window -- that can write our one-time server back after we restored it.
+# Undo that here, then forget the record.
+if [ $DRY = 0 ] && [ -f "$OVERRIDE_FILE" ]; then
+  restore_startup
+  rm -f "$OVERRIDE_FILE"
+fi
+
+# 1. Stop the Proton app for real.
+if app_running; then
+  say "stopping Proton app"
+  run pkill -TERM -f "$APP_RE"
+  if [ $DRY = 0 ] && ! wait_for 5 app_gone; then
+    say "Proton app ignored SIGTERM, killing it"
+    pkill -KILL -f "$APP_RE"
+    wait_for 3 app_gone
+  fi
+else
+  say "Proton app not running"
+fi
+
+# 2. Remove the connections Proton leaves in NetworkManager (a reboot clears these too):
+#    the WireGuard tunnel ("ProtonVPN ...") and the kill-switch / IPv6-leak dummies ("pvpn-...").
+nmcli -t -f UUID,NAME connection show | while IFS=: read -r uuid name; do
+  case "$name" in
+    "ProtonVPN "*|pvpn-*) say "removing leftover connection: $name"; run nmcli connection delete uuid "$uuid" >/dev/null ;;
+  esac
+done
+
+# 2b. ...and the interfaces they ran on. NM deletes those along with the connections --
+#     but not once one has been disconnected by hand, e.g. "Disconnect" on pvpn-killswitch
+#     in the Plasma network menu. The dummy then stays behind with autoconnect
+#     blocked, the next kill switch Proton adds never activates on it, and Proton
+#     sits in "Connecting" for good (seen in practice: for two days).
+[ $DRY = 1 ] || wait_for 3 no_proton_ifaces
+for dev in $(proton_ifaces); do
+  say "removing leftover interface: $dev"
+  run nmcli device delete "$dev" >/dev/null 2>&1
+  if [ $DRY = 0 ] && proton_ifaces | grep -qx "$dev"; then
+    say "NOTE: could not remove $dev -- Proton may hang on 'Connecting'; remove it with: sudo ip link delete $dev"
+  fi
+done
+
+# 3. Wi-Fi back on and connected.
+if [ "$(nmcli radio wifi)" != enabled ]; then
+  say "Wi-Fi radio was OFF -- turning it on"
+  run nmcli radio wifi on
+fi
+if [ -n "$TARGET" ]; then
+  say "switching Wi-Fi to '$TARGET'"
+  run nmcli connection up id "$TARGET" >/dev/null
+elif [ $DRY = 0 ] && ! wait_for 20 wifi_up; then
+  say "Wi-Fi not connected after 20 s, asking NetworkManager to connect"
+  nmcli device connect "$WIFI_DEV" >/dev/null 2>&1
+fi
+if [ $DRY = 0 ] && ! wait_for 20 wifi_up; then
+  say "FAILED: Wi-Fi is not connected -- pick a network in the tray, then run vpn-reset again"
+  notify "VPN reset failed" "Wi-Fi is not connected. Pick a network, then run VPN Reset again."
+  exit 1
+fi
+say "Wi-Fi: $(wifi_name)"
+if [ -n "$WIRED_DEV" ] && [ "$(nmcli -g GENERAL.STATE device show "$WIRED_DEV" 2>/dev/null | cut -d' ' -f1)" = 100 ]; then
+  say "NOTE: Ethernet ($WIRED_DEV) is connected and outranks Wi-Fi -- if that cable goes to a router with no internet, unplug it"
+fi
+
+# 4. Make sure Proton starts on a server that answers. Its "fastest" pick comes from a
+#    cached list that can't see a server refusing connections; then the app just gives
+#    up with "VPN server NOT reachable" (seen: 45 of 244 servers in one city at once).
+SKIPPED=""; action=""; server=""; dead=""
+if [ -x "$PICK" ]; then
+  say "checking Proton's server pick"
+  details=$(mktemp)
+  read -r action server dead < <("$PICK" pick ${SKIP:+--skip "$SKIP"} 2>"$details")
+  while IFS= read -r line; do say "  $line"; done < "$details"
+  rm -f "$details"
+  if [ "${action:-}" = use ]; then
+    orig=$("$PICK" get-startup 2>/dev/null)
+    say "starting Proton on $server instead of $dead (one time only; setting stays $orig)"
+    if [ $DRY = 0 ]; then
+      mkdir -p "$STATE_DIR"
+      printf '%s\t%s\n' "$orig" "$server" > "$OVERRIDE_FILE"
+      trap restore_startup EXIT
+      trap 'exit 1' TERM INT HUP
+      "$PICK" set-startup "$server" --expect "$orig" && SKIPPED="$dead"
+    fi
+  elif [ "${action:-}" = pin ]; then
+    say "Proton will start on $server from now on (was $dead)"
+    if [ $DRY = 0 ]; then
+      "$PICK" set-pin "$server" --expect "$dead" \
+        || say "NOTE: $server not saved as the startup server -- the setting changed meanwhile"
+    fi
+  fi
+else
+  say "NOTE: $PICK missing -- not checking servers"
+fi
+
+# 5. Relaunch Proton (outside this script's process tree); it auto-connects on start.
+say "starting Proton app"
+run systemd-run --user --collect --quiet /usr/bin/protonvpn-app
+[ $DRY = 1 ] && { echo "dry-run done"; exit 0; }
+
+# 6. Report. (The app has read its settings by now, so the EXIT trap can restore them.)
+if wait_for $WAIT_VPN vpn_up; then
+  vpn=$(nmcli -t -f NAME,TYPE connection show --active | awk -F: '$2=="wireguard"{print $1}')
+  say "OK: VPN connected ($vpn) over $(wifi_name)${SKIPPED:+ -- instead of $SKIPPED}"
+  notify "VPN back up" "$vpn over $(wifi_name)${SKIPPED:+ (instead of $SKIPPED)}"
+else
+  say "FAILED: Proton did not connect within ${WAIT_VPN}s over '$(wifi_name)'"
+  notify "VPN reset: not connected" "Proton didn't connect over $(wifi_name). If that network has no internet, switch Wi-Fi and run VPN Reset again."
+  exit 1
+fi

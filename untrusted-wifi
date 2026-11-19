@@ -1,0 +1,96 @@
+#!/bin/bash
+# NetworkManager dispatcher: every Wi-Fi except the trusted networks gets a strict
+# egress filter on the Wi-Fi interface. Only DHCP + Proton VPN entry servers may be
+# reached directly; everything else must go through the VPN tunnel (other interface).
+# Installed as /etc/NetworkManager/dispatcher.d/10-untrusted-wifi (+ pre-up.d symlink).
+#
+# Settings: /etc/net-hardening/untrusted-wifi.conf (see examples/untrusted-wifi.conf.example).
+# That file decides which networks skip the lock, so it is only read if root owns it and
+# nobody else can write to it. Otherwise no network is trusted and, without WIFI_IFACE,
+# every wireless interface gets the lock.
+CONF=/etc/net-hardening/untrusted-wifi.conf
+WIFI_IFACE=""          # Wi-Fi interface to guard (set in $CONF)
+TRUSTED_IDS=()         # NetworkManager connection names that skip the lock (set in $CONF)
+PROTON_SERVERLIST=""   # Proton's cached server list (set in $CONF)
+TABLE=untrusted_wifi
+LOG="logger -t untrusted-wifi"
+
+conf_ok() {  # root-owned, not group/world-writable
+  local owner mode
+  read -r owner mode < <(stat -L -c '%u %a' "$CONF" 2>/dev/null) || return 1
+  [ "$owner" = 0 ] && (( (8#$mode & 8#022) == 0 ))
+}
+conf_good=0
+if conf_ok; then . "$CONF"; conf_good=1; fi
+
+IFACE="$1"; ACTION="$2"
+if [ -n "$WIFI_IFACE" ]; then
+  [ "$IFACE" = "$WIFI_IFACE" ] || exit 0
+else
+  [ -d "/sys/class/net/$IFACE/wireless" ] || exit 0
+fi
+IFACE_WIFI=$IFACE
+[ $conf_good = 1 ] || $LOG "WARNING: $CONF missing, not owned by root, or writable by others -- trusting no network"
+
+proton_ips() {
+  python3 - "$PROTON_SERVERLIST" <<'PY' 2>/dev/null
+import json,sys
+d=json.load(open(sys.argv[1]))
+ips=sorted({s.get('EntryIP') for l in d.get('LogicalServers',[]) for s in l.get('Servers',[]) if s.get('EntryIP')})
+print(', '.join(ips))
+PY
+}
+
+apply_strict() {
+  local ips; ips=$(proton_ips)
+  local vpn_rule
+  if [ -n "$ips" ]; then
+    vpn_rule="ip daddr { $ips } accept"
+  else
+    # no server list: fall back to Proton's WireGuard/OpenVPN ports (weaker: UDP 443 also carries QUIC)
+    vpn_rule="udp dport { 80, 88, 443, 500, 1194, 1224, 4500, 4569, 5060, 51820 } accept"
+    $LOG "WARNING: Proton server list unreadable, using port fallback"
+  fi
+  nft -f - <<NFT
+table inet $TABLE
+delete table inet $TABLE
+table inet $TABLE {
+  chain out {
+    type filter hook output priority 0; policy accept;
+    oifname != "$IFACE_WIFI" accept
+    udp sport 68 udp dport 67 accept
+    icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
+    $vpn_rule
+    counter drop
+  }
+  chain in {
+    type filter hook input priority 0; policy accept;
+    iifname != "$IFACE_WIFI" accept
+    ct state established,related accept
+    udp sport 67 udp dport 68 accept
+    icmpv6 type { nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept
+    counter drop
+  }
+}
+NFT
+  $LOG "STRICT on $IFACE_WIFI (connection '${CONNECTION_ID:-none}', action $ACTION)"
+}
+
+remove_strict() {
+  nft delete table inet $TABLE 2>/dev/null && $LOG "relaxed: trusted network '$CONNECTION_ID'"
+  true
+}
+
+trusted() {
+  local id
+  for id in "${TRUSTED_IDS[@]}"; do [ "${CONNECTION_ID:-}" = "$id" ] && return 0; done
+  return 1
+}
+
+case "$ACTION" in
+  pre-up|up|dhcp4-change|connectivity-change)
+    if trusted; then remove_strict; else apply_strict; fi ;;
+  down|pre-down)
+    apply_strict ;;   # not connected anywhere yet: default to strict (harmless)
+esac
+exit 0

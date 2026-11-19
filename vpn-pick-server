@@ -1,0 +1,342 @@
+#!/usr/bin/python3
+"""vpn-pick-server: helper for vpn-reset -- find a Proton server that actually answers.
+
+At startup the Proton app connects to "the fastest server in <country>" from its
+cached server list. That list can't tell when a server is up but refusing
+connections (seen in practice: 45 of 244 servers in one city answered ping but
+refused TCP), so the app keeps choosing the same dead server and gives up with
+"VPN server NOT reachable". This replays the app's own choice (same ranking code,
+same TCP check) and, if that server doesn't answer, names the fastest one that
+does.
+
+Cities listed in ~/.config/net-hardening/vpn-avoid (one per line) are never
+picked -- for a city whose servers keep failing. Servers whose exit IPs are all in
+the CIDR ranges listed in ~/.config/net-hardening/vpn-prefer are tried first.
+
+Pinned mode: the app can't be told "fastest in the US but not <city>" -- its
+connect-at-startup setting takes only a country, FASTEST, or one server. So
+`manage US` makes vpn-reset keep that setting on one good server (fastest in the
+US outside the avoided cities) and move it to another when that one stops
+working. If you change the setting yourself, pinning stops and yours is kept.
+
+  vpn-pick-server pick [--skip NAME]
+      prints one line:
+        keep NAME        the app's own choice answers -- nothing to do
+        use NAME DEAD    the app would pick DEAD (not answering, avoided or
+                         skipped); NAME is the fastest server that answers
+        pin NAME OLD     pinned mode: make NAME the startup server (was OLD)
+        none -           can't help (autoconnect off, nothing answered, no list)
+      --skip NAME: the tunnel to NAME just died -- leave out NAME and every
+      server on the same machine (entry IP). Details go to stderr.
+  vpn-pick-server get-startup
+      print connect_at_app_startup from Proton's app-config.json (empty if off)
+  vpn-pick-server set-startup VALUE [--expect CURRENT]
+      set connect_at_app_startup in Proton's app-config.json; with --expect,
+      only if it currently holds CURRENT. Exit 1 if not changed.
+  vpn-pick-server manage COUNTRY
+      turn on pinned mode for COUNTRY (takes effect at the next vpn-reset)
+  vpn-pick-server set-pin NAME --expect CURRENT
+      pinned mode: set the startup server to NAME and remember it
+  vpn-pick-server unpin
+      turn pinned mode off; the startup setting goes back to the country
+  vpn-pick-server landmarks
+      print entry IPs of 3 well-ranked servers in different cities (for
+      checking the internet outside the tunnel)
+"""
+import concurrent.futures as cf
+import json
+import os
+import socket
+import sys
+
+APP_CONFIG = os.path.expanduser("~/.config/Proton/VPN/app-config.json")
+SERVERLIST = os.path.expanduser("~/.cache/Proton/VPN/serverlist.json")
+AVOID_FILE = os.path.expanduser("~/.config/net-hardening/vpn-avoid")
+PREFER_FILE = os.path.expanduser("~/.config/net-hardening/vpn-prefer")
+PIN_FILE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                        "vpn-reset", "pinned")      # "<country>\t<server we set>"
+TCP_PORTS = (443, 7770, 8443)  # the app's pre-connect check uses the OpenVPN TCP ports
+TIMEOUT = 3                    # the app waits 5 s; a server that answers does so in ~25 ms
+BATCH = 16                     # servers checked at once
+MAX_CANDIDATES = 64
+
+
+def log(msg):
+    print(msg, file=sys.stderr)
+
+
+def load_app_config():
+    with open(APP_CONFIG) as f:
+        return json.load(f)
+
+
+def get_startup():
+    return (load_app_config().get("connect_at_app_startup") or "").upper()
+
+
+def read_avoid():
+    try:
+        with open(AVOID_FILE) as f:
+            lines = [line.strip() for line in f]
+    except OSError:
+        return set()
+    return {line.lower() for line in lines if line and not line.startswith("#")}
+
+
+def read_prefer():
+    """CIDR ranges (one per line) of exit IPs to try first, e.g. Proton's own network."""
+    import ipaddress
+    nets = []
+    try:
+        with open(PREFER_FILE) as f:
+            lines = [line.strip() for line in f]
+    except OSError:
+        return nets
+    for line in lines:
+        if line and not line.startswith("#"):
+            try:
+                nets.append(ipaddress.ip_network(line, strict=False))
+            except ValueError:
+                log(f"vpn-prefer: ignoring {line!r}")
+    return nets
+
+
+def is_preferred(server, nets):
+    import ipaddress
+    for p in server.physical_servers:
+        ip = getattr(p, "exit_ip", None) or p.entry_ip
+        if not any(ipaddress.ip_address(ip) in n for n in nets):
+            return False
+    return bool(server.physical_servers)
+
+
+def read_pin():
+    try:
+        with open(PIN_FILE) as f:
+            country, server = f.read().rstrip("\n").split("\t")
+    except (OSError, ValueError):
+        return None
+    return country.upper(), server.upper()
+
+
+def write_pin(country, server):
+    os.makedirs(os.path.dirname(PIN_FILE), exist_ok=True)
+    tmp = PIN_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(f"{country}\t{server}\n")
+    os.replace(tmp, PIN_FILE)
+
+
+def ranked_servers(target, fallback_country=None):
+    """All servers in the order the app would rank them for `target` (best first).
+    For a server name, that server comes first, then the rest of its country; if it
+    has gone from the list, `fallback_country`'s ranking (or an error without one)."""
+    from proton.vpn.session.exceptions import ServerNotFoundError
+    from proton.vpn.session.servers.logicals import ServerList
+    from proton.vpn.session.servers.types import ServerFeatureEnum
+
+    with open(SERVERLIST) as f:
+        servers = ServerList.from_dict(json.load(f))
+    pinned = None
+    if "#" in target:                  # a specific server: try it, then its country
+        try:
+            pinned = servers.get_by_name(target)
+            target = pinned.exit_country
+        except ServerNotFoundError:
+            if fallback_country is None:
+                raise
+            log(f"{target} is no longer in Proton's server list")
+            target = fallback_country
+    if target == "FASTEST":
+        pool = servers.logicals
+    else:                              # a country code, e.g. "US"
+        pool = ServerList.get_servers_in_country_code(servers.logicals, target)
+    # Same filters as ServerList.get_fastest_in_country / get_fastest.
+    pool = ServerList.get_available_servers(pool, servers.user_tier)
+    pool = ServerList.get_servers_with_features(
+        pool, exclude_features=ServerFeatureEnum.SECURE_CORE | ServerFeatureEnum.TOR)
+    ranked = sorted(pool, key=lambda s: s.score)
+    if pinned is not None:
+        ranked = [pinned] + [s for s in ranked if s.name != pinned.name]
+    return ranked
+
+
+_ip_cache = {}
+
+
+def ip_answers(ip):
+    if ip not in _ip_cache:
+        def port_open(port):
+            try:
+                with socket.create_connection((ip, port), timeout=TIMEOUT):
+                    return True
+            except OSError:
+                return False
+        with cf.ThreadPoolExecutor(len(TCP_PORTS)) as ex:
+            _ip_cache[ip] = any(ex.map(port_open, TCP_PORTS))
+    return _ip_cache[ip]
+
+
+def entry_ips(server):
+    return {p.entry_ip for p in server.physical_servers if p.enabled}
+
+
+def server_answers(server):
+    # The app connects to a random enabled physical server, so all of them must answer.
+    ips = entry_ips(server)
+    return bool(ips) and all(ip_answers(ip) for ip in ips)
+
+
+def pick(skip=None):
+    try:
+        target = get_startup()
+    except (OSError, ValueError) as e:
+        log(f"can't read {APP_CONFIG}: {e}")
+        return "none -"
+    if not target:
+        log("Proton's 'connect at startup' is off -- nothing to pick")
+        return "none -"
+    pin = read_pin()
+    pinned_mode = pin is not None and pin[1] == target
+    try:
+        ranked = ranked_servers(target, pin[0] if pinned_mode else None)
+    except Exception as e:  # missing/odd server list, unknown server name, Proton lib changed
+        log(f"can't rank servers for {target!r}: {e}")
+        return "none -"
+    if not ranked:
+        log(f"no servers available for {target!r}")
+        return "none -"
+    choice = ranked[0]                 # what the app would connect to
+    # In pinned mode the setting may hold a country (first run) or a server that has
+    # left the list; then nothing is "kept" -- whatever wins gets pinned.
+    keepable = not pinned_mode or choice.name == target
+
+    avoid = read_avoid()
+    skip_ips = set()
+    if skip:
+        skip = skip.upper()
+        skip_ips = {ip for s in ranked if s.name == skip for ip in entry_ips(s)}
+    left_out = []
+    for s in ranked:
+        if s.city.lower() in avoid:
+            left_out.append(f"{s.name} ({s.city}: on the avoid list)")
+        elif s.name == skip or entry_ips(s) & skip_ips:
+            left_out.append(f"{s.name} (tunnel to {skip} just died{'' if s.name == skip else ', same machine'})")
+    usable = [s for s in ranked if s.city.lower() not in avoid
+              and s.name != skip and not entry_ips(s) & skip_ips]
+    # Preferred ranges first (best-ranked first within each group); the rest stay as
+    # fallback so a dead preferred network never leaves us without a tunnel.
+    prefer = read_prefer()
+    if prefer:
+        usable = [s for s in usable if is_preferred(s, prefer)] + \
+                 [s for s in usable if not is_preferred(s, prefer)]
+    usable = usable[:MAX_CANDIDATES]
+    if left_out:
+        shown = ", ".join(left_out[:3]) + (f" and {len(left_out) - 3} more" if len(left_out) > 3 else "")
+        log(f"left out: {shown}")
+
+    dead = []
+    for i in range(0, len(usable), BATCH):
+        batch = usable[i:i + BATCH]
+        with cf.ThreadPoolExecutor(len(batch)) as ex:
+            ok = list(ex.map(server_answers, batch))
+        for server, answers in zip(batch, ok):
+            if not answers:
+                dead.append(server.name)
+                continue
+            if dead:
+                log(f"not answering: {', '.join(dead)}")
+            if server is choice and keepable:
+                log(f"{server.name} ({server.city}, load {server.load}%) answers")
+                return f"keep {server.name}"
+            log(f"fastest that answers: {server.name} ({server.city}, load {server.load}%)")
+            if pinned_mode:
+                return f"pin {server.name} {target}"
+            return f"use {server.name} {choice.name}"
+    log(f"none of the top {len(usable)} usable servers for {target!r} answered -- network problem?")
+    return "none -"
+
+
+def set_startup(value, expect=None):
+    cfg = load_app_config()
+    current = cfg.get("connect_at_app_startup") or ""
+    if expect is not None and current.upper() != expect.upper():
+        log(f"connect_at_app_startup is {current!r}, not {expect!r} -- left alone")
+        return 1
+    cfg["connect_at_app_startup"] = value
+    tmp = APP_CONFIG + ".vpn-reset.tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=4)  # same format the app writes
+    os.replace(tmp, APP_CONFIG)
+    return 0
+
+
+def manage(country):
+    current = get_startup()
+    if not current:
+        log("Proton's 'connect at startup' is off -- turn it on first")
+        return 1
+    write_pin(country.upper(), current)
+    return 0
+
+
+def set_pin(server, expect):
+    pin = read_pin()
+    if pin is None or pin[1] != expect.upper():
+        log("pinned mode is off (or the setting was changed) -- not pinning")
+        return 1
+    if set_startup(server.upper(), expect=expect) != 0:
+        return 1
+    write_pin(pin[0], server.upper())
+    return 0
+
+
+def unpin():
+    pin = read_pin()
+    if pin is not None and get_startup() == pin[1]:
+        set_startup(pin[0], expect=pin[1])
+        log(f"connect-at-startup back to {pin[0]}")
+    try:
+        os.remove(PIN_FILE)
+    except FileNotFoundError:
+        pass
+    return 0
+
+
+def landmarks():
+    """Entry IPs of the 3 best-ranked servers in different cities."""
+    ips, cities = [], set()
+    for s in ranked_servers("FASTEST"):
+        if s.city in cities or not entry_ips(s):
+            continue
+        cities.add(s.city)
+        ips.append(sorted(entry_ips(s))[0])
+        if len(ips) == 3:
+            break
+    return ips
+
+
+def main(argv):
+    if argv[:1] == ["pick"] and (len(argv) == 1 or (len(argv) == 3 and argv[1] == "--skip")):
+        print(pick(argv[2] if len(argv) == 3 else None))
+        return 0
+    if argv == ["get-startup"]:
+        print(load_app_config().get("connect_at_app_startup") or "")
+        return 0
+    if argv[:1] == ["set-startup"] and len(argv) in (2, 4) and (len(argv) == 2 or argv[2] == "--expect"):
+        return set_startup(argv[1], argv[3] if len(argv) == 4 else None)
+    if argv[:1] == ["manage"] and len(argv) == 2:
+        return manage(argv[1])
+    if argv[:1] == ["set-pin"] and len(argv) == 4 and argv[2] == "--expect":
+        return set_pin(argv[1], argv[3])
+    if argv == ["unpin"]:
+        return unpin()
+    if argv == ["landmarks"]:
+        print(" ".join(landmarks()))
+        return 0
+    print(__doc__.split("\n\n", 4)[4], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,7 @@
+# ~/.config/net-hardening/vpn-prefer
+# Exit-IP ranges (CIDR, one per line) vpn-pick-server tries first. A server counts as
+# preferred only if all of its exit IPs are inside these ranges; every other server is
+# still used as a fallback. Blank lines and lines starting with # are ignored; lines
+# that aren't valid CIDR are skipped with a warning.
+# 192.0.2.0/24
+# 198.51.100.0/24

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run vpn-reset when Proton VPN is stuck retrying a dead server
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/vpn-failover
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

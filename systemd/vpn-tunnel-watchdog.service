@@ -1,0 +1,12 @@
+[Unit]
+Description=Run vpn-reset when Proton's tunnel goes silently dead
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/vpn-tunnel-watchdog
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

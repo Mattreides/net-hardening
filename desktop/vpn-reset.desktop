@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=VPN Reset
+GenericName=Fix stuck Proton VPN
+Comment=Restart Proton VPN cleanly and get back online without rebooting
+Exec=@HOME@/.local/bin/vpn-reset
+Icon=network-vpn
+Terminal=false
+Categories=Network;
+Keywords=proton;vpn;wifi;internet;reset;fix;

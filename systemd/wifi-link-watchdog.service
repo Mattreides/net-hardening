@@ -1,0 +1,12 @@
+[Unit]
+Description=Reconnect Wi-Fi when the link to the router goes silently dead
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/wifi-link-watchdog
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

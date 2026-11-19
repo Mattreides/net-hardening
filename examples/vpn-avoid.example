@@ -1,0 +1,5 @@
+# ~/.config/net-hardening/vpn-avoid
+# Cities vpn-pick-server (and so vpn-reset) never starts Proton on -- one per line,
+# spelled as in Proton's app. Case-insensitive; blank lines and lines starting with #
+# are ignored. Useful for a city whose servers keep failing.
+# Springfield

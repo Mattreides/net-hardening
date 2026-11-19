@@ -1,0 +1,89 @@
+#!/bin/bash
+# vpn-failover: run vpn-reset by itself when Proton is stuck retrying a dead server,
+# or stuck on "Connecting".
+#
+# When the server Proton is on stops taking connections, the app's reconnect logic
+# retries that SAME server forever, with growing gaps (2 s, 5 s, 16 s, 32 s, 66 s,
+# 127 s, 245 s ...), and the kill switch keeps you offline the whole time -- in
+# practice 5+ minutes per dead server, until the app was restarted by hand.
+# This watches Proton's log; after two
+# "VPN server NOT reachable" in a row it runs vpn-reset, which starts Proton on a
+# server that answers (never the one that just failed). vpn-tunnel-watchdog
+# catches the other kind of drop, where the tunnel dies but Proton hasn't noticed.
+#
+# It also catches the app hanging: "Connecting" logged and then nothing -- no
+# Connected, no Error -- for STUCK seconds (a normal connect takes 1-2 s; when a server
+# fails, Proton logs an Error within ~20 s). It has been seen to hang like that for
+# two days on a leftover kill-switch interface. That's not the server's fault, so this
+# reset doesn't skip it. Only while the app is still running -- if you quit or killed
+# it, it's left alone.
+#
+# It does nothing when you disconnect Proton yourself (no retries get logged).
+# If a reset doesn't get the VPN up (Wi-Fi or upstream internet down), it waits
+# twice as long before trying again, up to 30 min, until Proton connects.
+# It never touches the kill switch setting or the untrusted-wifi lock.
+#
+# Runs as a user service:  systemctl --user status vpn-failover
+# Logs:                    journalctl --user -u vpn-failover;  journalctl -t vpn-reset
+set -u
+HERE="$(dirname "$(readlink -f "$0")")"
+LOG="${VPN_FAILOVER_LOG:-$HOME/.cache/Proton/VPN/logs/vpn-app.log}"
+RESET="${VPN_FAILOVER_RESET:-$HERE/vpn-reset}"
+WINDOW="${VPN_FAILOVER_WINDOW:-120}"      # two failures this close together = stuck
+COOLDOWN="${VPN_FAILOVER_COOLDOWN:-180}"  # gap after a reset before another one
+STUCK="${VPN_FAILOVER_STUCK:-90}"         # "Connecting" this long with no outcome = hung
+TICK="${VPN_FAILOVER_TICK:-5}"            # how often to check for that while the log is quiet
+APP_RE="${VPN_FAILOVER_APP_RE:-^/usr/bin/python[0-9.]* /usr/bin/protonvpn-app}"
+MAX_COOLDOWN=1800
+
+echo "watching $LOG"
+fails=0; last_fail=0; last_reset=0; wait_s=$COOLDOWN; server="its server"; connecting_since=0
+
+reset_vpn() {  # reset_vpn <why> [vpn-reset args...]
+  echo "$1 -- running vpn-reset"
+  if "$RESET" "${@:2}"; then
+    echo "vpn-reset done"
+    wait_s=$COOLDOWN
+  else
+    wait_s=$(( wait_s * 2 > MAX_COOLDOWN ? MAX_COOLDOWN : wait_s * 2 ))
+    echo "vpn-reset didn't get the VPN up -- next try no sooner than ${wait_s}s"
+  fi
+  last_reset=$(date +%s); fails=0; connecting_since=0
+}
+
+# -F keeps following across Proton's log rotation (vpn-app.log -> vpn-app.log.1).
+# read -t wakes the loop every TICK s even when the log is silent -- a hung app logs nothing.
+tail -n0 -F "$LOG" 2>/dev/null | while :; do
+  IFS= read -r -t "$TICK" line; rc=$?
+  if (( rc != 0 )); then
+    (( rc > 128 )) || break        # tail went away (EOF), not just a quiet log
+    line=""
+  fi
+  now=$(date +%s); notreach=0
+  case "$line" in
+    "") ;;
+    *"CONN.CONNECT:START | Server: "*)
+      server=${line#*Server: }; server=${server%% *} ;;
+    *"CONN:STATE_CHANGED | Connecting"*)
+      connecting_since=$now ;;
+    *"CONN:STATE_CHANGED | Connected"*|*"APP:PROCESS_START"*)
+      fails=0; wait_s=$COOLDOWN; connecting_since=0 ;;
+    *"CONN:STATE_CHANGED | "*)      # Error, Disconnecting, Disconnected: the attempt ended
+      connecting_since=0 ;;
+    *"VPN server NOT reachable"*)
+      if (( now - last_fail > WINDOW )); then fails=1; else fails=$((fails + 1)); fi
+      last_fail=$now; notreach=1 ;;
+  esac
+  (( now - last_reset >= wait_s )) || continue
+
+  if (( notreach && fails >= 2 )); then
+    skip=(); [[ $server == *"#"* ]] && skip=(--skip="$server")
+    reset_vpn "Proton can't reach $server ($fails tries in a row)" "${skip[@]}"
+  elif (( connecting_since > 0 && now - connecting_since >= STUCK )); then
+    if pgrep -f "$APP_RE" >/dev/null; then
+      reset_vpn "Proton has been stuck on 'Connecting' to $server for $(( now - connecting_since ))s"
+    else
+      connecting_since=0           # the app is gone (quit or killed) -- not ours to restart
+    fi
+  fi
+done
